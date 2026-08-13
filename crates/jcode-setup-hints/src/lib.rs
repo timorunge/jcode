@@ -1056,8 +1056,21 @@ fn run_macos_hotkey_listener() -> Result<()> {
                 .fresh_spawn()
                 .kind("hotkey")
                 .spawn_env("JCODE_SPAWN_LABEL", launch.label.clone());
-            match spawn_command_in_new_terminal_with(&command, &cwd, |cmd| cmd.spawn().map(|_| ()))
-            {
+            match spawn_command_in_new_terminal_with(&command, &cwd, |cmd| {
+                // Reap, do not `.map(|_| ())`: dropping a `Child` never waits,
+                // so the terminal we just launched stays a zombie holding a
+                // process-table slot. This runs in the long-lived hotkey
+                // daemon, so that is one leaked slot per hotkey press for the
+                // life of the login session.
+                let mut child = cmd.spawn()?;
+                std::thread::Builder::new()
+                    .name("hotkey-spawn-reaper".to_string())
+                    .spawn(move || {
+                        let _ = child.wait();
+                    })
+                    .map(|_| ())
+                    .or(Ok(()))
+            }) {
                 Ok(true) => {}
                 Ok(false) => {
                     macos_hotkey_log("failed to launch jcode: no terminal candidate worked")

@@ -32,7 +32,10 @@ pub fn spawn_command_in_new_terminal(command: &TerminalCommand, cwd: &Path) -> R
         return Ok(true);
     }
     jcode_terminal_launch::spawn_command_in_new_terminal_with(command, cwd, |cmd| {
-        crate::platform::spawn_detached(cmd).map(|_| ())
+        // `reap_detached`, not `spawn_detached(..).map(|_| ())`: mapping the
+        // handle away is exactly the shape that leaks, because dropping a
+        // `Child` never waits and the slot is held until this process exits.
+        crate::platform::reap_detached(cmd)
     })
 }
 

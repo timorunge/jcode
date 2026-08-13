@@ -28,6 +28,14 @@ type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 type ClientConnections = Arc<RwLock<HashMap<String, ClientConnectionInfo>>>;
 
+/// How long `stop` waits for a busy agent to yield its lock before refusing.
+///
+/// Long enough to cover the gap between two tool calls in a normal turn, short
+/// enough that a stop always answers. The failure this bounds is not slowness:
+/// it is deregistering a lane that is still running, which leaves an agent loop
+/// with no handle to reach it.
+const STOP_AGENT_LOCK_GRACE: std::time::Duration = std::time::Duration::from_millis(2000);
+
 /// Serialize spawn admission through member registration within one swarm.
 /// Without a reservation or lock, many recursive agents can all observe the same
 /// free slot and burst past the configured limit before any child is registered.
@@ -1085,12 +1093,66 @@ pub(super) async fn handle_comm_stop(
         return;
     };
 
+    // Acquire the agent lock BEFORE removing anything. A stop that deregisters
+    // a lane it did not actually stop leaves an agent loop running with no
+    // handle to reach it. That is what `try_lock` produced here: a BUSY agent is
+    // exactly the one that must be stopped and exactly the one holding this
+    // mutex, so the lock attempt failed, `mark_closed()` never ran, and the
+    // removal below happened regardless. The loops kept issuing API calls while
+    // `swarm list` could no longer see them and every further `stop` answered
+    // "Unknown swarm session". Unreachable-but-running is strictly worse than a
+    // loud failure.
+    //
+    // The wait is BOUNDED: an unbounded `lock().await` would park the stop path
+    // behind a turn that can run for minutes, and a stop that never returns is
+    // its own bug.
+    let stop_guard = {
+        let agent_arc = sessions.read().await.get(&target_session).cloned();
+        match agent_arc {
+            None => None,
+            Some(agent_arc) => {
+                match tokio::time::timeout(STOP_AGENT_LOCK_GRACE, agent_arc.clone().lock_owned())
+                    .await
+                {
+                    Ok(guard) => Some(guard),
+                    Err(_elapsed) => {
+                        // Not stopped, so do not deregister. Leaving it
+                        // registered keeps it addressable for a retry.
+                        crate::logging::warn(&format!(
+                            "swarm stop: session '{target_session}' did not yield within {}ms; \
+                             leaving it REGISTERED rather than deregistering a loop that is \
+                             still running",
+                            STOP_AGENT_LOCK_GRACE.as_millis()
+                        ));
+                        finish_request(
+                            swarm_mutation_runtime,
+                            &mutation_state,
+                            PersistedSwarmMutationResponse::Error {
+                                message: format!(
+                                    "'{target_session}' is mid-turn and did not stop within {}ms. \
+                                     It is still registered, so it stays addressable -- retry the \
+                                     stop, or interrupt the turn first. It was deliberately NOT \
+                                     deregistered: a lane removed from the registry while still \
+                                     running cannot be stopped by anything.",
+                                    STOP_AGENT_LOCK_GRACE.as_millis()
+                                ),
+                                retry_after_secs: Some(2),
+                            },
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+        }
+    };
+
     let removed_agent = super::remove_session_entry(sessions, &target_session).await;
     let removed_live_agent = removed_agent.is_some();
-    if let Some(agent_arc) = removed_agent {
+    if removed_agent.is_some() {
         remove_session_interrupt_queue(soft_interrupt_queues, &target_session).await;
         remove_background_tool_signal(&target_session);
-        if let Ok(mut agent) = agent_arc.try_lock() {
+        if let Some(mut agent) = stop_guard {
             agent.mark_closed();
             let memory_enabled = agent.memory_enabled();
             let transcript = if memory_enabled {

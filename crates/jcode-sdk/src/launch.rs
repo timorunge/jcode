@@ -485,13 +485,25 @@ pub fn ensure_runtime(options: &LaunchOptions, progress: &Progress<'_>) -> Resul
 }
 
 fn spawn_detached(program: &Path, args: &[&str]) -> std::io::Result<()> {
-    Command::new(program)
+    let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .map(drop)
+        .spawn()?;
+    // `.map(drop)` was the original here, and dropping a `Child` does NOT wait:
+    // the process stays a zombie holding a process-table slot until this
+    // process exits. Harmless in a short-lived CLI, unbounded in anything
+    // long-lived, and these two spawns start daemons that outlive the call.
+    // The waiter thread is short-lived by construction -- it ends when the
+    // child does.
+    std::thread::Builder::new()
+        .name("sdk-detached-reaper".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+        })
+        .map(|_| ())
+        .or(Ok(()))
 }
 
 /// Block until `path` accepts connections, or the timeout expires.

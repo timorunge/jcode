@@ -155,3 +155,53 @@ fn spawn_replacement_process_returns_without_waiting_for_child_exit() {
     child.kill().ok();
     let _ = child.wait();
 }
+
+/// A detached spawn must not leave a zombie behind.
+///
+/// `setsid` detaches the session, not the parent-child relationship, so a
+/// dropped `Child` is never waited on and its process-table slot is held for
+/// the lifetime of the host. In a daemon that dispatches a hook per tool call
+/// this is unbounded, and it ends with `fork` failing for everything on the
+/// machine.
+#[cfg(unix)]
+#[test]
+fn reap_detached_leaves_no_zombie() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let zombies = || -> usize {
+        let out = Command::new("ps")
+            .args([
+                "-u",
+                &format!("{}", unsafe { libc::getuid() }),
+                "-o",
+                "stat=",
+            ])
+            .output()
+            .expect("ps should run");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|line| line.trim_start().starts_with('Z'))
+            .count()
+    };
+
+    let before = zombies();
+
+    let mut cmd = Command::new("true");
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    super::reap_detached(&mut cmd).expect("detached spawn should succeed");
+
+    // The reaper runs on its own thread, so poll rather than assuming it has
+    // already finished. A fixed sleep would either be flaky or slow.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if zombies() <= before {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    panic!("zombie count did not return to {before} -- the child was not reaped");
+}

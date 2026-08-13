@@ -398,6 +398,18 @@ pub fn atomic_symlink_swap(src: &Path, dst: &Path, temp: &Path) -> std::io::Resu
 /// This is used for launching new terminal windows (for `/resume`, `/split`,
 /// crash restore, etc.) so the new client survives if the invoking jcode
 /// process exits or its terminal closes.
+///
+/// `setsid` detaches the SESSION, not the parent-child relationship: the child
+/// still has this process as its parent, so it becomes a zombie holding a
+/// process-table slot until someone calls `wait` on it. Most callers here are
+/// fire-and-forget and drop the `Child`, which never reaps -- so a long-lived
+/// host that dispatches an observer hook per tool call leaks one slot per call,
+/// forever. That is how a machine reaches the point where every `fork` fails
+/// with `EAGAIN` while almost nothing is actually running.
+///
+/// `reap_detached` hands the child to a detached waiter so the slot is released
+/// without blocking the caller. Callers that WANT the handle (to wait, kill, or
+/// read its output) keep using `spawn_detached`.
 pub fn spawn_detached(cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
     #[cfg(unix)]
     {
@@ -422,6 +434,36 @@ pub fn spawn_detached(cmd: &mut std::process::Command) -> std::io::Result<std::p
     }
 
     cmd.spawn()
+}
+
+/// Spawn a detached process and REAP it, for callers that never look at the
+/// handle again.
+///
+/// Fire-and-forget spawning is the common case here (observer hooks, focus
+/// hooks, notifications), and dropping a `Child` does not wait -- so each one
+/// leaves a zombie occupying a process-table slot for the lifetime of the host.
+/// In a long-lived daemon that is an unbounded leak measured in slots per tool
+/// call, and it ends with `fork` returning `EAGAIN` for everything on the
+/// machine, including the hooks that are supposed to guard it.
+///
+/// The wait happens on its own thread so the caller is never blocked by a hook
+/// that runs long. One thread per detached spawn is acceptable precisely
+/// because it is short-lived: it exists only until the child exits.
+pub fn reap_detached(cmd: &mut std::process::Command) -> std::io::Result<()> {
+    let mut child = spawn_detached(cmd)?;
+    std::thread::Builder::new()
+        .name("detached-reaper".to_string())
+        .spawn(move || {
+            // Errors are deliberately ignored: the only outcomes are "the child
+            // exited" (slot released, done) and "it was already reaped", and
+            // neither is actionable by the caller, which returned long ago.
+            let _ = child.wait();
+        })
+        // If a thread cannot be spawned the process table is already in trouble.
+        // Falling back to a blocking wait here would freeze the caller, so let
+        // the child be leaked and let the capacity guard report the pressure.
+        .map(|_| ())
+        .or(Ok(()))
 }
 
 #[cfg(windows)]

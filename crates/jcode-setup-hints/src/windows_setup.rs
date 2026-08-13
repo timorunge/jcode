@@ -319,7 +319,17 @@ fn launch_windows_hotkey(entry: &WindowsHotkey) -> Result<()> {
 
     let launched =
         jcode_terminal_launch::spawn_command_in_new_terminal_with(&command, &cwd, |cmd| {
-            cmd.spawn().map(|_| ())
+            // Reap rather than dropping the handle: a dropped `Child` is never
+            // waited on, so the slot is held for the life of this process.
+            // Harmless in a one-shot CLI, a leak in anything long-lived.
+            let mut child = cmd.spawn()?;
+            std::thread::Builder::new()
+                .name("launch-hotkey-reaper".to_string())
+                .spawn(move || {
+                    let _ = child.wait();
+                })
+                .map(|_| ())
+                .or(Ok(()))
         })?;
     if !launched {
         anyhow::bail!("no terminal found to launch jcode");

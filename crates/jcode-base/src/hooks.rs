@@ -37,6 +37,38 @@ const TOOL_INPUT_ENV_LIMIT: usize = 16 * 1024;
 /// Maximum chars of hook stderr used as a block reason.
 const BLOCK_REASON_LIMIT: usize = 2000;
 
+/// `EAGAIN` -- `fork` failed because the process table is full. The errno
+/// differs by platform, and `std::io::ErrorKind` does not reliably map it for
+/// spawn failures, so both spellings are matched explicitly.
+const EAGAIN_BSD: i32 = 35;
+const EAGAIN_LINUX: i32 = 11;
+/// `ENOMEM` -- same class of failure, no memory to build the child.
+const ENOMEM_LINUX: i32 = 12;
+
+/// Is this spawn failure the machine being out of resources, rather than the
+/// hook being wrong?
+///
+/// The distinction decides whether failing OPEN is safe. A hook that exits
+/// non-zero, times out, or does not parse is a broken hook, and allowing the
+/// tool call is right -- a user must never be locked out by their own bad
+/// config. `EAGAIN`/`ENOMEM` from `spawn` is a different fact: the machine
+/// cannot start ANY process, so the guard set is absent for every tool call
+/// until that clears, and the calls most likely to be issued next are recovery
+/// commands typed under pressure.
+fn is_resource_exhaustion(error: &std::io::Error) -> bool {
+    // WouldBlock is EAGAIN, which is what fork() returns when the process
+    // table is full. OutOfMemory covers ENOMEM. Checked via raw_os_error too
+    // because the ErrorKind mapping for spawn failures is not guaranteed
+    // across platforms.
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::OutOfMemory
+    ) || matches!(
+        error.raw_os_error(),
+        Some(errno) if errno == EAGAIN_BSD || errno == EAGAIN_LINUX || errno == ENOMEM_LINUX
+    )
+}
+
 /// Decision returned by the `pre_tool` gate hook.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateDecision {
@@ -232,8 +264,8 @@ pub fn dispatch_observer(event: HookEvent) {
                 cmd.stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null());
-                match crate::platform::spawn_detached(&mut cmd) {
-                    Ok(_) => crate::logging::debug(&format!(
+                match crate::platform::reap_detached(&mut cmd) {
+                    Ok(()) => crate::logging::debug(&format!(
                         "Hook '{event_name}' dispatched to '{command_line}' (session={:?})",
                         event.session_id
                     )),
@@ -314,6 +346,32 @@ async fn run_pre_tool_command(
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
+        Err(error) if is_resource_exhaustion(&error) => {
+            // FAIL CLOSED. Every other failure here allows the call, because a
+            // broken hook must not lock the user out of their own machine. This
+            // one is different in kind: the machine cannot start a process, so
+            // NO tool call is being checked, and the calls most likely to be
+            // issued next are recovery commands typed under pressure.
+            //
+            // Blocking is also the only signal the agent loop can act on. A
+            // resource failure reported as Allow looks identical to a fast
+            // success, so the loop retries immediately and each retry attempts
+            // several more spawns -- the storm feeds itself.
+            crate::logging::warn(&format!(
+                "Hook 'pre_tool' command '{command_line}' could not be spawned: {error}. \
+                 The process table is full, so NO tool call is being guarded -- blocking \
+                 rather than running unguarded."
+            ));
+            return GateDecision::Block {
+                reason: format!(
+                    "the machine is out of process slots ({error}), so the tool-use guards \
+                     cannot run and this call would be unguarded.\n\
+                     Nothing can spawn right now, including the command you are trying to run.\n\
+                     Check with: ps -u \"$(id -u)\" | wc -l\n\
+                     Usual cause: too many concurrent agent lanes. Stop some and retry."
+                ),
+            };
+        }
         Err(error) => {
             crate::logging::warn(&format!(
                 "Hook 'pre_tool' command '{command_line}' failed to start: {error} (allowing tool call)"
@@ -399,6 +457,34 @@ mod tests {
         assert!(truncated.len() <= 3);
         assert!(text.starts_with(truncated));
         assert_eq!(truncate_bytes("short", 100), "short");
+    }
+
+    #[test]
+    fn resource_exhaustion_is_distinguished_from_an_ordinary_spawn_failure() {
+        use std::io::{Error, ErrorKind};
+
+        // The two that mean "the machine cannot start a process".
+        assert!(is_resource_exhaustion(&Error::from(ErrorKind::WouldBlock)));
+        assert!(is_resource_exhaustion(&Error::from(ErrorKind::OutOfMemory)));
+        // EAGAIN as a raw errno: 35 on macOS/BSD, 11 on Linux. This is the
+        // spelling that actually reaches the log when the process table fills,
+        // and ErrorKind does not reliably map it, which is why the raw check
+        // exists at all.
+        assert!(is_resource_exhaustion(&Error::from_raw_os_error(
+            EAGAIN_BSD
+        )));
+        assert!(is_resource_exhaustion(&Error::from_raw_os_error(
+            EAGAIN_LINUX
+        )));
+
+        // Everything else is a BROKEN HOOK, which must keep failing open --
+        // a user must never be locked out by their own bad config. NotFound is
+        // the common one: a hook path that does not exist.
+        assert!(!is_resource_exhaustion(&Error::from(ErrorKind::NotFound)));
+        assert!(!is_resource_exhaustion(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!is_resource_exhaustion(&Error::from(ErrorKind::TimedOut)));
     }
 
     #[cfg(unix)]
